@@ -140,11 +140,10 @@ public class Qwen3ASRModel {
     /// Whether the model weights are loaded and ready for inference.
     var _isLoaded = true
 
-    /// MLX cache limit captured at load time for the .large variant. Stored
-    /// per-instance so `unload()` can restore it — preventing the 4 GB cap
-    /// from leaking into co-loaded models (PersonaPlex loads ASR + LM + TTS
-    /// in the same process). `nil` when no cap was applied (small variant
-    /// or already-capped global state).
+    /// MLX cache limit captured at load time. Stored per-instance so
+    /// `unload()` can restore it — preventing the realtime cap from leaking
+    /// into co-loaded models (PersonaPlex loads ASR + LM + TTS in the same
+    /// process). `nil` when no cap was applied (already-capped global state).
     var savedMLXCacheLimit: Int?
 
     init(
@@ -336,6 +335,34 @@ public class Qwen3ASRModel {
         )
     }
 
+    /// Bounded live continuation; callers reset previousText and completedPasses per audio segment.
+    public func transcribeContinuation(audio: [Float], language: String?, previousText: String, completedPasses: Int, maxTokens: Int = 448) -> String {
+        let prefix = completedPasses >= 2 ? continuationPrefix(previousText, tokens: 5) : ""
+        let effective = Qwen3DecodingOptions(maxTokens: maxTokens, language: language)
+            .adaptedFor(audioDurationSeconds: Double(audio.count) / 16000)
+        let mel = featureExtractor.process(audio, sampleRate: 16000)
+        let embeds = audioEncoder(mel.expandedDimensions(axis: 0)).expandedDimensions(axis: 0)
+        guard let decoder = textDecoder else { preconditionFailure("Decoder unavailable") }
+        return generateText(audioEmbeds: embeds, textDecoder: decoder, language: effective.language,
+                            maxTokens: effective.maxTokens, context: effective.context,
+                            decodingOptions: effective, transcriptionPrefix: prefix,
+                            checkCancellation: {})
+    }
+
+    private func continuationPrefix(_ previous: String, tokens: Int) -> String {
+        guard let tokenizer else { preconditionFailure("Tokenizer unavailable") }
+        let ids = tokenizer.encode(previous)
+        var count = max(0, ids.count - max(0, tokens))
+        while count > 0 {
+            let prefix = tokenizer.decode(tokens: Array(ids.prefix(count)))
+            // A token can end inside a UTF-8 character. Roll farther back until
+            // the decoded prefix is both valid and a literal prefix of the text.
+            if !prefix.contains("\u{FFFD}"), previous.hasPrefix(prefix) { return prefix }
+            count -= 1
+        }
+        return ""
+    }
+
     /// Transcribe audio to text
     ///
     /// Long-input adaptive decoding: the legacy overload constructs a
@@ -420,6 +447,7 @@ public class Qwen3ASRModel {
         maxTokens: Int,
         context: String? = nil,
         decodingOptions: Qwen3DecodingOptions = Qwen3DecodingOptions(),
+        transcriptionPrefix: String = "",
         checkCancellation: () throws -> Void
     ) rethrows -> String {
         let T = Qwen3ASRTokens.self
@@ -459,6 +487,10 @@ public class Qwen3ASRModel {
             inputIds.append(contentsOf: langTokens.map { Int32($0) })
         }
         inputIds.append(Int32(T.asrTextTokenId))
+        // Live continuation: assistant output prefix (not system context).
+        if !transcriptionPrefix.isEmpty, let tokenizer {
+            inputIds.append(contentsOf: tokenizer.encode(transcriptionPrefix).map(Int32.init))
+        }
 
         // Get text embeddings for all tokens
         let inputIdsTensor = MLXArray(inputIds).expandedDimensions(axis: 0)
@@ -515,9 +547,9 @@ public class Qwen3ASRModel {
             let rawText = tokenizer.decode(tokens: generatedTokens.map { Int($0) })
             // Strip "language XX<asr_text>" prefix if present (auto-detection output)
             if let range = rawText.range(of: "<asr_text>") {
-                return String(rawText[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                return transcriptionPrefix + String(rawText[range.upperBound...]).trimmingCharacters(in: .whitespaces)
             }
-            return rawText
+            return transcriptionPrefix + rawText
         } else {
             // Fallback: return token IDs
             return generatedTokens.map { String($0) }.joined(separator: " ")
@@ -1240,6 +1272,15 @@ internal enum Qwen3ASRMemory {
         return max(0, min(fourGB, quarterRAM))
     }
 
+    /// Tighter ceiling for the 0.6B realtime path. Live streaming issues many
+    /// short/medium windows; unconstrained cache otherwise climbs several GB
+    /// within a couple of minutes.
+    static func cacheLimitForSmall(physicalMemoryBytes: Int) -> Int {
+        let oneGB = 1 * 1024 * 1024 * 1024
+        let eighthRAM = physicalMemoryBytes / 8
+        return max(256 * 1024 * 1024, min(oneGB, eighthRAM))
+    }
+
     /// True when the 1.7B variant should print the soft RAM warning. Total
     /// (not available) RAM is the pragmatic signal — see threshold doc.
     static func shouldWarnForLarge(physicalMemoryBytes: UInt64) -> Bool {
@@ -1359,13 +1400,9 @@ public extension Qwen3ASRModel {
 
         MetalBudget.pinMemory()
 
-        // Bug 4b: cap MLX scratch pool for the 1.7B variant. Default cache
-        // limit tracks `recommendedMaxWorkingSetSize` which on a 16 GB Mac
-        // can grow to several GB during sustained decoding and trigger
-        // swap. Bounding to `min(4 GB, 25% of physical RAM)` leaves enough
-        // headroom for per-token decoder working set while keeping the
-        // total residency under the OS jetsam threshold. 0.6B path is
-        // unchanged.
+        // Cap MLX scratch pool for all ASR sizes. Default cache limit tracks
+        // `recommendedMaxWorkingSetSize`, which on a 16 GB Mac can grow to
+        // several GB during sustained realtime decoding and trigger swap.
         //
         // Process-global cap leak fix (adversarial review): we save the
         // prior limit on the model instance and restore it in `unload()`,
@@ -1374,9 +1411,11 @@ public extension Qwen3ASRModel {
         // of the loaded ASR. Stacks correctly across multiple ASR
         // instances: each save captures whatever was active when it
         // loaded, and each unload pops its own saved value.
-        if modelSize == .large {
+        do {
             let physical = Int(ProcessInfo.processInfo.physicalMemory)
-            let newCap = Qwen3ASRMemory.cacheLimitForLarge(physicalMemoryBytes: physical)
+            let newCap = modelSize == .large
+                ? Qwen3ASRMemory.cacheLimitForLarge(physicalMemoryBytes: physical)
+                : Qwen3ASRMemory.cacheLimitForSmall(physicalMemoryBytes: physical)
             // Only apply the cap if it would lower the current limit —
             // never raise a limit a caller has already chosen for itself.
             let currentLimit = MLX.Memory.cacheLimit
